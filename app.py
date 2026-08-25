@@ -33,6 +33,8 @@ SESSION_COOKIE = "rpp_admin"
 SESSION_TTL = 7 * 24 * 3600
 BLOCKED_PORTS = {25, 465, 587}
 RELAY_BUFFER = 256 * 1024
+USAGE_BATCH = 1024 * 1024
+POLICY_CHECK_INTERVAL = 3.0
 
 _db_lock = RLock()
 _conn_counts: dict[str, int] = {}
@@ -560,26 +562,48 @@ async def vless_ws(ws: WebSocket, path_token: str):
         await ws.send_bytes(b"\x00\x00")
 
         async def client_to_remote():
-            while True:
-                item = await ws.receive()
-                if item["type"] == "websocket.disconnect": return
-                data = item.get("bytes") or b""
-                if not data: continue
-                fresh = get_user(uid)
-                if not user_is_allowed(fresh): return
-                writer.write(data)
-                if writer.transport.get_write_buffer_size() > RELAY_BUFFER:
-                    await writer.drain()
-                await add_usage(uid, len(data))
+            local_usage = 0
+            last_policy_check = 0.0
+            try:
+                while True:
+                    item = await ws.receive()
+                    if item["type"] == "websocket.disconnect": return
+                    data = item.get("bytes") or b""
+                    if not data: continue
+                    now = time.monotonic()
+                    if now - last_policy_check >= POLICY_CHECK_INTERVAL:
+                        if not user_is_allowed(get_user(uid)): return
+                        last_policy_check = now
+                    writer.write(data)
+                    if writer.transport.get_write_buffer_size() > 1024 * 1024:
+                        await writer.drain()
+                    local_usage += len(data)
+                    if local_usage >= USAGE_BATCH:
+                        await add_usage(uid, local_usage)
+                        local_usage = 0
+            finally:
+                if local_usage:
+                    await add_usage(uid, local_usage)
 
         async def remote_to_client():
-            while True:
-                data = await reader.read(RELAY_BUFFER)
-                if not data: return
-                fresh = get_user(uid)
-                if not user_is_allowed(fresh): return
-                await ws.send_bytes(data)
-                await add_usage(uid, len(data))
+            local_usage = 0
+            last_policy_check = 0.0
+            try:
+                while True:
+                    data = await reader.read(RELAY_BUFFER)
+                    if not data: return
+                    now = time.monotonic()
+                    if now - last_policy_check >= POLICY_CHECK_INTERVAL:
+                        if not user_is_allowed(get_user(uid)): return
+                        last_policy_check = now
+                    await ws.send_bytes(data)
+                    local_usage += len(data)
+                    if local_usage >= USAGE_BATCH:
+                        await add_usage(uid, local_usage)
+                        local_usage = 0
+            finally:
+                if local_usage:
+                    await add_usage(uid, local_usage)
 
         tasks = {asyncio.create_task(client_to_remote()), asyncio.create_task(remote_to_client())}
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)

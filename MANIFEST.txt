@@ -10,6 +10,7 @@ VERSION
 app.py
 docker-compose.yml
 docs/BOT-BEHAVIOR-FA.md
+docs/HIGH-VOLUME-FA.txt
 docs/ربات-در-یک-دقیقه.txt
 docs/معماری-و-امنیت.txt
 railway.toml
