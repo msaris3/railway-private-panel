@@ -1,0 +1,24 @@
+اتصال سریع ربات در یک دقیقه
+===========================
+
+آدرس پنل:
+https://YOUR-PANEL.up.railway.app
+
+کلید محرمانه:
+BOT_API_KEY که در Railway Variables گذاشته‌اید.
+
+ساخت کاربر:
+POST https://YOUR-PANEL.up.railway.app/api/v1/users
+
+Header:
+Authorization: Bearer BOT_API_KEY
+Content-Type: application/json
+
+Body:
+{"name":"Ali","quota_gb":20,"max_connections":2,"expires_at":null}
+
+ربات باید از پاسخ فقط مقدار زیر را به کاربر بدهد:
+user.subscription_url
+
+مستند کامل:
+docs/BOT-BEHAVIOR-FA.md
