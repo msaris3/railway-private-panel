@@ -2,10 +2,12 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import html as htmllib
 import ipaddress
 import json
 import logging
 import os
+import re
 import secrets
 import socket
 import sqlite3
@@ -18,7 +20,7 @@ from threading import RLock
 from urllib.parse import quote
 from collections import deque
 
-from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 
 APP_NAME = "Railway Private Panel"
@@ -32,6 +34,16 @@ SESSION_SECRET = os.getenv("SESSION_SECRET", "")
 SESSION_COOKIE = "rpp_admin"
 SESSION_TTL = 7 * 24 * 3600
 BLOCKED_PORTS = {25, 465, 587}
+
+
+# وب‌پس مخفی پنل: ریشه‌ی دامنه صفحه‌ی بی‌ربط می‌دهد و پنل فقط زیر این مسیر بالا می‌آید
+def _clean_web_path(raw) -> str:
+    value = re.sub(r"[^A-Za-z0-9_-]", "", str(raw or "").strip().strip("/"))
+    return value[:48]
+
+
+WEB_PATH = _clean_web_path(os.getenv("WEB_PATH", ""))
+PANEL_PREFIX = ("/" + WEB_PATH) if WEB_PATH else ""
 RELAY_BUFFER = 256 * 1024
 USAGE_BATCH = 1024 * 1024
 POLICY_CHECK_INTERVAL = 3.0
@@ -130,6 +142,11 @@ def get_user(user_id: str):
         return rowdict(conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone())
 
 
+def get_user_by_name(name: str):
+    with _db_lock, db() as conn:
+        return rowdict(conn.execute("SELECT * FROM users WHERE lower(name)=lower(?) ORDER BY created_at DESC LIMIT 1", (name,)).fetchone())
+
+
 def get_user_by_sub(sub_token: str):
     with _db_lock, db() as conn:
         return rowdict(conn.execute("SELECT * FROM users WHERE sub_token=?", (sub_token,)).fetchone())
@@ -201,7 +218,7 @@ def public_user(user: dict, primary: str) -> dict:
         "expires_at": user["expires_at"], "max_connections": user["max_connections"],
         "created_at": user["created_at"], "links": links,
         "active_connections": _conn_counts.get(user["id"], 0),
-        "subscription_url": "https://" + primary + "/sub/" + user["sub_token"],
+        "subscription_url": "https://" + primary + "/s/" + user["sub_token"],
     }
 
 
@@ -236,6 +253,10 @@ def require_bot(request: Request):
 
 def create_user_record(body: dict) -> dict:
     name = str(body.get("name") or "کاربر جدید").strip()[:80]
+    if not name:
+        raise HTTPException(400, "name is required")
+    if get_user_by_name(name):
+        raise HTTPException(409, "username already exists")
     quota_gb = max(0.0, float(body.get("quota_gb") or 0))
     quota_bytes = int(quota_gb * 1024 ** 3)
     max_connections = min(20, max(0, int(body.get("max_connections", 0))))
@@ -268,7 +289,12 @@ def update_user_record(user_id: str, body: dict) -> dict:
     if not user:
         raise HTTPException(404, "user not found")
     updates = {}
-    if "name" in body: updates["name"] = str(body["name"]).strip()[:80]
+    if "name" in body:
+        new_name = str(body["name"]).strip()[:80]
+        other = get_user_by_name(new_name)
+        if other and other["id"] != user_id:
+            raise HTTPException(409, "username already exists")
+        updates["name"] = new_name
     if "enabled" in body: updates["enabled"] = 1 if body["enabled"] else 0
     if "quota_gb" in body: updates["quota_bytes"] = int(max(0.0, float(body["quota_gb"])) * 1024 ** 3)
     if "max_connections" in body: updates["max_connections"] = min(20, max(0, int(body["max_connections"])))
@@ -377,29 +403,515 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title=APP_NAME, docs_url=None, redoc_url=None, lifespan=lifespan)
 
 
+FAKE_HTML = r"""
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow,noarchive,nosnippet">
+<title>Fern &amp; Fig — plant notes</title>
+<style>
+:root{--ink:#26372b;--soft:#6d7f70;--line:#e2eae1;--leaf:#4f8a5b;--cream:#fbfdf9}
+*{box-sizing:border-box}
+body{margin:0;background:var(--cream);color:var(--ink);font:16px/1.75 Georgia,'Times New Roman',serif;padding:48px 20px}
+.wrap{max-width:640px;margin:auto}
+.mark{width:46px;height:46px;border-radius:14px;background:#eaf4ea;display:grid;place-items:center;margin-bottom:22px}
+h1{font-size:28px;margin:0 0 6px;letter-spacing:.2px}
+.sub{color:var(--soft);font-size:14px;margin:0 0 30px}
+h2{font-size:18px;margin:34px 0 8px}
+p{margin:0 0 14px}
+ul{margin:0 0 14px;padding-inline-start:20px}
+li{margin-bottom:6px}
+.note{border-inline-start:3px solid var(--leaf);background:#f3f8f2;padding:12px 16px;border-radius:0 10px 10px 0;color:#3d5844;font-size:15px}
+footer{margin-top:40px;padding-top:18px;border-top:1px solid var(--line);color:var(--soft);font-size:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="mark"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#4f8a5b" stroke-width="1.6" stroke-linecap="round"><path d="M12 21c0-6 3-11 8-13-1 8-4 12-8 13Z"/><path d="M12 21C8 20 5 16 4 8c5 2 8 7 8 13Z"/><path d="M12 21v-5"/></svg></div>
+  <h1>Fern &amp; Fig</h1>
+  <p class="sub">A small notebook about houseplants, soil mixes and slow mornings.</p>
+
+  <p>This page is a personal archive of watering notes. Nothing here is automated, nothing is for sale, and there is no newsletter to sign up for.</p>
+
+  <h2>Watering rhythm</h2>
+  <ul>
+    <li>Fiddle leaf fig — every 9 days, room temperature water.</li>
+    <li>Boston fern — misted twice a week, never soaked.</li>
+    <li>Pothos — whenever the top inch of soil turns dry.</li>
+    <li>Snake plant — once a month, less in winter.</li>
+  </ul>
+
+  <h2>Soil mix that worked</h2>
+  <p>Four parts coco coir, two parts perlite, one part worm castings and a handful of pine bark. It drains fast and the ferns stopped sulking after two weeks.</p>
+
+  <div class="note">Note to self: repot the monstera before spring, and stop buying pots that have no drainage hole.</div>
+
+  <h2>Light notes</h2>
+  <p>The east window carries soft morning light until about eleven. Anything that browns at the tips gets moved one meter back, and it usually recovers within a month.</p>
+
+  <footer>Kept as a private garden journal. Last tidy-up: this spring.</footer>
+</div>
+</body>
+</html>
+"""
+
+
+SUB_HTML = r"""
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="robots" content="noindex,nofollow,noarchive,nosnippet">
+<meta name="theme-color" content="#f2f8f1">
+<title>__NAME__ · اشتراک</title>
+<style>
+*{box-sizing:border-box}
+:root{
+ --ink:#1f3226;--soft:#65806e;--line:#dfeade;--white:#fff;
+ --leaf:#3f8f57;--leaf2:#6bbd7d;--leaf-soft:#eaf5ea;--gold:#c98a2e;--rose:#c9564b;
+ --r:20px;--sh:0 1px 2px rgba(31,50,38,.05),0 12px 32px rgba(31,50,38,.07)
+}
+html,body{margin:0;padding:0}
+body{
+ font:15px/1.8 -apple-system,BlinkMacSystemFont,"Segoe UI",Vazirmatn,Tahoma,sans-serif;
+ color:var(--ink);min-height:100vh;padding:22px 14px 40px;
+ background:
+  radial-gradient(760px 420px at 90% -10%,#e7f4e6 0,transparent 70%),
+  radial-gradient(620px 380px at 5% 8%,#f0f8ee 0,transparent 65%),
+  linear-gradient(180deg,#f7fbf6,#f2f8f1 55%,#eef6ee);
+}
+.wrap{max-width:660px;margin:auto}
+.card{background:var(--white);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--sh);padding:22px;margin-bottom:16px}
+header.card{display:flex;align-items:center;gap:14px}
+.logo{width:52px;height:52px;flex:0 0 52px;border-radius:16px;background:linear-gradient(150deg,#eaf5ea,#d9eedb);display:grid;place-items:center}
+.who{flex:1;min-width:0}
+h1{font-size:20px;margin:0 0 3px;font-weight:800;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.who p{margin:0;color:var(--soft);font-size:13px}
+.chip{flex:0 0 auto;font-size:12px;font-weight:700;padding:7px 13px;border-radius:999px;background:var(--leaf-soft);color:#2e6c41;border:1px solid #cfe7d2}
+.chip.warn{background:#fdf5e6;color:#8a5c14;border-color:#f0e0be}
+.chip.off{background:#fdeeec;color:#a83a30;border-color:#f2cfcb}
+.hero{display:flex;gap:20px;align-items:center;flex-wrap:wrap}
+.ring{--p:0;width:132px;height:132px;flex:0 0 132px;border-radius:50%;display:grid;place-items:center;
+ background:conic-gradient(var(--leaf) calc(var(--p)*1%),#eaf1e9 0)}
+.ring.hot{background:conic-gradient(var(--gold) calc(var(--p)*1%),#f3ede2 0)}
+.hole{width:104px;height:104px;border-radius:50%;background:var(--white);display:grid;place-items:center;text-align:center;box-shadow:inset 0 0 0 1px #edf3ec}
+.hole b{display:block;font-size:26px;font-weight:800;line-height:1.2}
+.hole b i{font-size:14px;font-style:normal;color:var(--soft)}
+.hole small{color:var(--soft);font-size:12px}
+.tiles{flex:1;min-width:230px;display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.tile{background:#f8fbf7;border:1px solid #e9f1e8;border-radius:14px;padding:11px 13px}
+.tile small{display:block;color:var(--soft);font-size:11.5px;margin-bottom:3px}
+.tile b{font-size:14.5px;font-weight:800}
+.tile b i{font-style:normal;font-weight:500;color:var(--soft);font-size:12px}
+.boxhead{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px}
+h2{font-size:15.5px;margin:0;font-weight:800}
+h2 span{color:var(--soft);font-weight:500;font-size:12.5px}
+.btn{border:1px solid var(--leaf);background:var(--leaf);color:#fff;font:inherit;font-size:13px;font-weight:700;
+ min-height:38px;padding:0 15px;border-radius:11px;cursor:pointer;transition:.15s}
+.btn:active{transform:translateY(1px)}
+.btn.ghost{background:#fff;color:#2e6c41;border-color:#cfe7d2}
+.btn.tiny{min-height:32px;padding:0 12px;font-size:12px}
+.url{direction:ltr;text-align:left;font:12.5px/1.7 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+ background:#f6faf5;border:1px dashed #d5e6d4;border-radius:12px;padding:11px 13px;word-break:break-all;color:#2c4433}
+.apps{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}
+.app{display:inline-flex;align-items:center;gap:7px;text-decoration:none;font-size:12.5px;font-weight:700;color:#2e6c41;
+ background:#f4faf3;border:1px solid #dceadb;border-radius:11px;padding:9px 13px}
+.app:active{background:#eaf5ea}
+.app u{text-decoration:none;color:var(--soft);font-weight:500}
+.hint{color:var(--soft);font-size:12.5px;margin:12px 0 0}
+.cfg{display:flex;align-items:center;gap:11px;padding:11px 0;border-top:1px solid #f0f5ef}
+.cfg:first-of-type{border-top:0}
+.cfg .n{width:28px;height:28px;flex:0 0 28px;border-radius:9px;background:var(--leaf-soft);color:#2e6c41;
+ display:grid;place-items:center;font-size:12.5px;font-weight:800}
+.cfg .t{flex:1;min-width:0}
+.cfg .t b{display:block;font-size:13.5px}
+.cfg .t span{display:block;color:var(--soft);font-size:11.5px;direction:ltr;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+details{border:1px solid #e9f1e8;border-radius:14px;padding:0 13px;margin-bottom:9px;background:#fcfefb}
+details[open]{background:#f8fbf7}
+summary{cursor:pointer;font-weight:700;font-size:13.5px;padding:12px 0;list-style:none;display:flex;justify-content:space-between;align-items:center}
+summary::-webkit-details-marker{display:none}
+summary::after{content:"+";color:var(--leaf);font-weight:800;font-size:17px}
+details[open] summary::after{content:"−"}
+.steps{margin:0 0 12px;padding-inline-start:19px;color:#33503c;font-size:13px}
+.steps li{margin-bottom:5px}
+.muted{color:var(--soft);font-size:12.5px;margin:0}
+footer{text-align:center;color:var(--soft);font-size:12px;padding:6px 4px 0;line-height:2}
+.toast{position:fixed;inset-inline:0;bottom:20px;margin:auto;width:max-content;max-width:88%;
+ background:#1f3226;color:#fff;font-size:13px;padding:11px 18px;border-radius:12px;
+ opacity:0;transform:translateY(12px);transition:.22s;pointer-events:none;z-index:9}
+.toast.on{opacity:1;transform:none}
+@media(max-width:560px){
+ .hero{gap:14px}.ring{width:112px;height:112px;flex:0 0 112px}.hole{width:88px;height:88px}
+ .hole b{font-size:22px}.tiles{grid-template-columns:1fr 1fr;min-width:100%}.card{padding:18px}
+}
+@media(prefers-color-scheme:dark){
+ :root{--ink:#e7f0e7;--soft:#9db3a3;--line:#28362b;--white:#16211a;--leaf-soft:#1e3324}
+ body{background:linear-gradient(180deg,#111a14,#0f1712 60%,#101a13)}
+ .tile,.url,.app,details{background:#182319;border-color:#28362b}
+ details[open]{background:#1a2620}
+ .hole{background:var(--white);box-shadow:inset 0 0 0 1px #26332a}
+ .ring{background:conic-gradient(var(--leaf2) calc(var(--p)*1%),#22301f 0)}
+ .btn.ghost{background:#182319;color:#9fd8ac;border-color:#2c3f30}
+ .cfg{border-color:#243027}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="card">
+    <div class="logo">
+      <svg width="27" height="27" viewBox="0 0 24 24" fill="none" stroke="#3f8f57" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 22c0-6.5 3.2-11.6 8.5-13.8C19.6 16 16.4 20.4 12 22Z"/>
+        <path d="M12 22C7.6 21 4.4 16.4 3.5 8.2 8.8 10.4 12 15.5 12 22Z"/>
+        <path d="M12 22v-4.4"/>
+      </svg>
+    </div>
+    <div class="who">
+      <h1>__NAME__</h1>
+      <p>اشتراک شخصی · __COUNT__ سرور فعال</p>
+    </div>
+    <span class="chip __STATE_CLASS__">__STATE_TEXT__</span>
+  </header>
+
+  <section class="card hero">
+    <div class="ring __RING_CLASS__" style="--p:__PCT_NUM__">
+      <div class="hole"><b>__PCT__<i>٪</i></b><small>مصرف شده</small></div>
+    </div>
+    <div class="tiles">
+      <div class="tile"><small>مصرف شده</small><b>__USED__</b></div>
+      <div class="tile"><small>باقی‌مانده</small><b>__REMAIN__</b></div>
+      <div class="tile"><small>حجم کل</small><b>__TOTAL__</b></div>
+      <div class="tile"><small>__EXPIRE_LABEL__</small><b>__EXPIRE__</b></div>
+      <div class="tile"><small>دستگاه متصل</small><b>__DEVICES__ <i>از __DEVICE_LIMIT__</i></b></div>
+      <div class="tile"><small>اتصال لحظه‌ای</small><b>__TUNNELS__</b></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="boxhead">
+      <h2>لینک اشتراک <span>یک بار وارد شود، همیشه به‌روز</span></h2>
+      <button class="btn" data-copy="__SUB_URL__">کپی لینک</button>
+    </div>
+    <div class="url">__SUB_URL__</div>
+    <div class="apps">
+      <a class="app" href="hiddify://import/__SUB_URL__#__NAME_ENC__">Hiddify <u>افزودن</u></a>
+      <a class="app" href="v2box://install-sub?url=__SUB_URL_ENC__&amp;name=__NAME_ENC__">V2Box <u>افزودن</u></a>
+      <a class="app" href="v2rayng://install-sub?url=__SUB_URL_ENC__">v2rayNG <u>افزودن</u></a>
+      <a class="app" href="streisand://import/__SUB_URL__">Streisand <u>افزودن</u></a>
+      <a class="app" href="sub://__SUB_B64__">Shadowrocket <u>افزودن</u></a>
+      <a class="app" href="clash://install-config?url=__SUB_URL_ENC__">Clash <u>افزودن</u></a>
+      <a class="app" href="sing-box://import-remote-profile?url=__SUB_URL_ENC__">sing-box <u>افزودن</u></a>
+    </div>
+    <p class="hint">دکمه‌های بالا لینک را مستقیم داخل برنامه اضافه می‌کنند. اگر باز نشد، لینک را کپی کن و در برنامه گزینه‌ی «افزودن اشتراک از کلیپ‌بورد» را بزن.</p>
+  </section>
+
+  <section class="card">
+    <div class="boxhead">
+      <h2>کانفیگ‌های مستقیم <span>برای اتصال دستی</span></h2>
+      <button class="btn ghost" id="copyAll">کپی همه</button>
+    </div>
+    __CONFIG_ROWS__
+  </section>
+
+  <section class="card">
+    <div class="boxhead"><h2>راهنمای اتصال <span>دو دقیقه کار دارد</span></h2></div>
+
+    <details open>
+      <summary>اندروید</summary>
+      <ol class="steps">
+        <li>یکی از برنامه‌ها را نصب کن: <a href="https://play.google.com/store/apps/details?id=dev.hexasoftware.v2box">V2Box</a> ، <a href="https://play.google.com/store/apps/details?id=com.netmod.syna">NetMod Syna</a> ، <a href="https://github.com/2dust/v2rayNG/releases">v2rayNG</a> ، <a href="https://github.com/hiddify/hiddify-app/releases">Hiddify</a></li>
+        <li>دکمه‌ی «کپی لینک» همین صفحه را بزن.</li>
+        <li>در برنامه: <b>Subscription ← +</b> یا «افزودن از کلیپ‌بورد».</li>
+        <li>یک بار <b>Update</b> بزن و سرور را وصل کن.</li>
+      </ol>
+      <p class="muted">اگر برنامه نصب است، همان دکمه‌های سبز بالا کار را در یک مرحله تمام می‌کند.</p>
+    </details>
+
+    <details>
+      <summary>آیفون و آیپد</summary>
+      <ol class="steps">
+        <li>نصب از App Store: <a href="https://apps.apple.com/app/id6446814690">V2Box</a> ، <a href="https://apps.apple.com/app/id6450534064">Streisand</a> ، <a href="https://apps.apple.com/app/id6596777532">Hiddify</a> ، <a href="https://apps.apple.com/app/id6476628140">Karing</a> ، <a href="https://apps.apple.com/app/id932747118">Shadowrocket</a></li>
+        <li>لینک اشتراک را کپی کن.</li>
+        <li>در برنامه: <b>Configs ← + ← Add Subscription</b> و لینک را پیست کن.</li>
+        <li>اجازه‌ی VPN را تأیید کن و وصل شو.</li>
+      </ol>
+    </details>
+
+    <details>
+      <summary>ویندوز</summary>
+      <ol class="steps">
+        <li>نصب: <a href="https://github.com/2dust/v2rayN/releases">v2rayN</a> ، <a href="https://github.com/hiddify/hiddify-app/releases">Hiddify</a> ، <a href="https://github.com/MatsuriDayo/NekoBoxForAndroid/releases">NekoBox</a></li>
+        <li>لینک اشتراک را کپی کن.</li>
+        <li>در v2rayN: <b>Subscription ← Subscription group setting ← Add</b> و پیست کن، بعد <b>Update subscription</b>.</li>
+        <li>حالت سیستم را روی <b>Proxy</b> بگذار.</li>
+      </ol>
+    </details>
+
+    <details>
+      <summary>مک و لینوکس</summary>
+      <ol class="steps">
+        <li>نصب: <a href="https://apps.apple.com/app/id6446814690">V2Box مک</a> ، <a href="https://github.com/hiddify/hiddify-app/releases">Hiddify</a> ، <a href="https://github.com/clash-verge-rev/clash-verge-rev/releases">Clash Verge</a></li>
+        <li>لینک اشتراک را کپی کن و در برنامه به عنوان Profile/Subscription اضافه کن.</li>
+        <li>یک بار به‌روزرسانی بزن و سرور را انتخاب کن.</li>
+      </ol>
+    </details>
+
+    <details>
+      <summary>مشکل داری؟</summary>
+      <ul class="steps">
+        <li>اگر وصل شد ولی اینترنت نداری، یک سرور دیگر از لیست را امتحان کن.</li>
+        <li>اگر حجم تمام شده یا تاریخ گذشته، همین صفحه وضعیت را نشان می‌دهد.</li>
+        <li>لینک اشتراک را با کسی به اشتراک نگذار؛ تعداد دستگاه محدود است.</li>
+        <li>هر چند روز یک بار در برنامه <b>Update</b> بزن تا سرورهای جدید بیایند.</li>
+      </ul>
+    </details>
+  </section>
+
+  <footer>
+    به‌روزرسانی: __UPDATED__ · این صفحه فقط برای شماست<br>
+    لینک اشتراک را جایی منتشر نکن
+  </footer>
+</div>
+
+<div id="toast" class="toast"></div>
+<script>
+(function(){
+  var t=document.getElementById('toast'),timer=null;
+  function say(m){t.textContent=m;t.classList.add('on');clearTimeout(timer);timer=setTimeout(function(){t.classList.remove('on')},1900)}
+  function copy(text,msg){
+    if(navigator.clipboard&&navigator.clipboard.writeText){
+      navigator.clipboard.writeText(text).then(function(){say(msg)},function(){fallback(text,msg)})
+    }else{fallback(text,msg)}
+  }
+  function fallback(text,msg){
+    var a=document.createElement('textarea');a.value=text;a.setAttribute('readonly','');
+    a.style.position='fixed';a.style.top='-1000px';document.body.appendChild(a);a.select();
+    try{document.execCommand('copy');say(msg)}catch(e){say('کپی نشد، دستی انتخاب کن')}
+    document.body.removeChild(a)
+  }
+  document.addEventListener('click',function(e){
+    var el=e.target.closest('[data-copy]');
+    if(el){e.preventDefault();copy(el.getAttribute('data-copy'),'کپی شد ✓');return}
+    if(e.target.id==='copyAll'){
+      var all=[].map.call(document.querySelectorAll('.cfg [data-copy]'),function(x){return x.getAttribute('data-copy')});
+      if(all.length){copy(all.join('\n'),'همه‌ی کانفیگ‌ها کپی شد ✓')}else{say('کانفیگی نیست')}
+    }
+  })
+})();
+</script>
+</body>
+</html>
+"""
+
+NOINDEX = {"x-robots-tag": "noindex, nofollow, noarchive"}
+FA_DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
+JMONTHS = ("فروردین", "اردیبهشت", "خرداد", "تیر", "مرداد", "شهریور", "مهر", "آبان", "آذر", "دی", "بهمن", "اسفند")
+BYTE_UNITS = ("بایت", "کیلوبایت", "مگابایت", "گیگابایت", "ترابایت")
+CLIENT_UA_HINTS = (
+    "v2ray", "v2box", "hiddify", "clash", "sing-box", "singbox", "shadowrocket", "streisand",
+    "nekobox", "nekoray", "karing", "loon", "quantumult", "surge", "stash", "foxray", "sagernet",
+    "netmod", "okhttp", "go-http-client", "curl", "wget", "python-requests", "node-fetch", "dart",
+)
+
+
+def fa(value) -> str:
+    return str(value).translate(FA_DIGITS)
+
+
+def esc(value) -> str:
+    return htmllib.escape(str(value if value is not None else ""), quote=True)
+
+
+def fmt_bytes(value) -> str:
+    amount = float(value or 0)
+    if amount <= 0:
+        return fa("0") + " " + BYTE_UNITS[0]
+    step = 0
+    while amount >= 1024 and step < len(BYTE_UNITS) - 1:
+        amount /= 1024.0
+        step += 1
+    if step <= 1 or amount >= 100:
+        text = "%.0f" % amount
+    else:
+        text = ("%.2f" % amount).rstrip("0").rstrip(".")
+    return fa(text) + " " + BYTE_UNITS[step]
+
+
+def to_jalali(moment: datetime):
+    gy, gm, gd = moment.year, moment.month, moment.day
+    months = (0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334)
+    gy2 = gy - 1600
+    days = 365 * gy2 + (gy2 + 3) // 4 - (gy2 + 99) // 100 + (gy2 + 399) // 400
+    days += months[gm - 1] + gd - 1
+    if gm > 2 and ((gy % 4 == 0 and gy % 100 != 0) or gy % 400 == 0):
+        days += 1
+    days -= 79
+    cycles = days // 12053
+    days %= 12053
+    jy = 979 + 33 * cycles + 4 * (days // 1461)
+    days %= 1461
+    if days >= 366:
+        jy += (days - 1) // 365
+        days = (days - 1) % 365
+    if days < 186:
+        return jy, 1 + days // 31, 1 + days % 31
+    return jy, 7 + (days - 186) // 30, 1 + (days - 186) % 30
+
+
+def tehran_now() -> datetime:
+    return datetime.fromtimestamp(time.time() + 12600, timezone.utc)
+
+
+def jalali_stamp(moment: datetime) -> str:
+    jy, jm, jd = to_jalali(moment)
+    return fa("%d %s %d" % (jd, JMONTHS[jm - 1], jy))
+
+
+def jalali_text(raw) -> str:
+    if not raw:
+        return "بدون انقضا"
+    try:
+        moment = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return "نامشخص"
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    left = int((moment - datetime.now(timezone.utc)).total_seconds() // 86400)
+    stamp = jalali_stamp(datetime.fromtimestamp(moment.timestamp() + 12600, timezone.utc))
+    if left < 0:
+        return stamp + " · تمام شده"
+    if left == 0:
+        return stamp + " · امروز"
+    return stamp + " · " + fa(left) + " روز مانده"
+
+
+def live_devices(user: dict) -> int:
+    return int(_conn_counts.get(user["id"], 0))
+
+
+def wants_html(request: Request) -> bool:
+    accept = str(request.headers.get("accept") or "").lower()
+    agent = str(request.headers.get("user-agent") or "").lower()
+    if "text/html" not in accept:
+        return False
+    for hint in CLIENT_UA_HINTS:
+        if hint in agent:
+            return False
+    return "mozilla" in agent
+
+
+def with_base(page: str) -> str:
+    if not PANEL_PREFIX:
+        return page
+    out = page
+    out = out.replace("fetch('/auth/", "fetch(BASE+'/auth/")
+    out = out.replace("fetch('/api/", "fetch(BASE+'/api/")
+    out = out.replace("api('/api/", "api(BASE+'/api/")
+    out = out.replace("location='/dashboard'", "location=BASE+'/dashboard'")
+    out = out.replace("location='/login'", "location=BASE+'/login'")
+    out = out.replace("location.origin+'/api/", "location.origin+BASE+'/api/")
+    return out.replace("<script>", "<script>var BASE=" + json.dumps(PANEL_PREFIX) + ";", 1)
+
+
+def render_subscription_page(user: dict, links: list, sub_url: str) -> str:
+    used = int(user.get("used_bytes") or 0)
+    quota = int(user.get("quota_bytes") or 0)
+    devices = live_devices(user)
+    limit = int(user.get("max_connections") or 0)
+    percent = min(100, int(round(used * 100.0 / quota))) if quota else 0
+    allowed = user_is_allowed(user)
+    if not user.get("enabled"):
+        state_class, state_text = "off", "غیرفعال"
+    elif not allowed:
+        state_class, state_text = "off", "پایان‌یافته"
+    elif quota and percent >= 85:
+        state_class, state_text = "warn", "نزدیک پایان حجم"
+    else:
+        state_class, state_text = "", "فعال"
+    rows = []
+    for index, link in enumerate(links, 1):
+        host = ""
+        if "@" in link:
+            host = link.split("@", 1)[1].split(":", 1)[0].split("?", 1)[0]
+        title = host or ("سرور " + str(index))
+        rows.append(
+            '<div class="cfg"><div class="n">' + fa(index) + '</div><div class="t"><b>'
+            + esc(title) + '</b><span>VLESS · WebSocket · TLS</span></div>'
+            + '<button class="btn ghost tiny" data-copy="' + esc(link) + '">کپی</button></div>'
+        )
+    if not rows:
+        rows.append('<p class="hint">این اشتراک فعلاً کانفیگ فعالی ندارد. با پشتیبانی در تماس باش.</p>')
+    values = {
+        "__NAME__": esc(user.get("name")),
+        "__NAME_ENC__": quote(str(user.get("name") or ""), safe=""),
+        "__COUNT__": fa(len(links)),
+        "__STATE_CLASS__": state_class,
+        "__STATE_TEXT__": state_text,
+        "__RING_CLASS__": "hot" if (quota and percent >= 85) else "",
+        "__PCT__": fa(percent),
+        "__PCT_NUM__": str(percent),
+        "__USED__": fmt_bytes(used),
+        "__TOTAL__": fmt_bytes(quota) if quota else "نامحدود",
+        "__REMAIN__": fmt_bytes(max(0, quota - used)) if quota else "نامحدود",
+        "__DEVICES__": fa(devices),
+        "__DEVICE_LIMIT__": fa(limit) if limit else "بی‌نهایت",
+        "__TUNNELS__": fa(devices),
+        "__EXPIRE_LABEL__": "اعتبار",
+        "__EXPIRE__": jalali_text(user.get("expires_at")),
+        "__SUB_URL__": esc(sub_url),
+        "__SUB_URL_ENC__": quote(sub_url, safe=""),
+        "__SUB_B64__": base64.b64encode(sub_url.encode()).decode(),
+        "__CONFIG_ROWS__": "\n    ".join(rows),
+        "__UPDATED__": jalali_stamp(tehran_now()) + " · " + fa(tehran_now().strftime("%H:%M")),
+    }
+    page = SUB_HTML
+    for key in sorted(values, key=len, reverse=True):
+        page = page.replace(key, values[key])
+    return page
+
+
+panel = APIRouter()
+
+
 @app.get("/health")
 async def health():
     return {"ok": True, "service": APP_NAME}
 
 
+@panel.get("/health")
+async def panel_health():
+    return {"ok": True, "service": APP_NAME}
+
+
 @app.get("/")
-async def root(request: Request):
-    return RedirectResponse("/dashboard" if valid_session(request.cookies.get(SESSION_COOKIE)) else "/login")
+async def landing():
+    # ریشه‌ی دامنه هیچ نشانه‌ای از پنل نمی‌دهد
+    return HTMLResponse(content=FAKE_HTML, headers=NOINDEX)
 
 
-@app.get("/login")
+@panel.get("/")
+async def panel_root(request: Request):
+    target = PANEL_PREFIX + ("/dashboard" if valid_session(request.cookies.get(SESSION_COOKIE)) else "/login")
+    return RedirectResponse(target)
+
+
+@panel.get("/login")
 async def login_page():
-    return HTMLResponse(content=LOGIN_HTML)
+    return HTMLResponse(content=with_base(LOGIN_HTML), headers=NOINDEX)
 
 
-@app.get("/dashboard")
+@panel.get("/dashboard")
 async def dashboard_page(request: Request):
     if not valid_session(request.cookies.get(SESSION_COOKIE)):
-        return RedirectResponse("/login")
-    return HTMLResponse(content=DASHBOARD_HTML)
+        return RedirectResponse(PANEL_PREFIX + "/login")
+    return HTMLResponse(content=with_base(DASHBOARD_HTML), headers=NOINDEX)
 
 
-@app.post("/auth/login")
+@panel.post("/auth/login")
 async def login(request: Request):
     body = await request.json()
     if not hmac.compare_digest(str(body.get("password", "")), ADMIN_PASSWORD):
@@ -411,20 +923,20 @@ async def login(request: Request):
     return response
 
 
-@app.post("/auth/logout")
+@panel.post("/auth/logout")
 async def logout():
     response = JSONResponse({"ok": True})
     response.delete_cookie(SESSION_COOKIE)
     return response
 
 
-@app.get("/api/admin/users")
+@panel.get("/api/admin/users")
 async def admin_users(request: Request, _=Depends(require_admin)):
     primary = request_host(request)
     return [public_user(u, primary) for u in list_users()]
 
 
-@app.get("/api/admin/status")
+@panel.get("/api/admin/status")
 async def admin_status(_=Depends(require_admin)):
     return {
         "active_streams": sum(_conn_counts.values()),
@@ -432,18 +944,18 @@ async def admin_status(_=Depends(require_admin)):
     }
 
 
-@app.post("/api/admin/users")
+@panel.post("/api/admin/users")
 async def admin_create_user(request: Request, _=Depends(require_admin)):
     user = create_user_record(await request.json())
     return public_user(user, request_host(request))
 
 
-@app.patch("/api/admin/users/{user_id}")
+@panel.patch("/api/admin/users/{user_id}")
 async def admin_update_user(user_id: str, request: Request, _=Depends(require_admin)):
     return public_user(update_user_record(user_id, await request.json()), request_host(request))
 
 
-@app.delete("/api/admin/users/{user_id}")
+@panel.delete("/api/admin/users/{user_id}")
 async def admin_delete_user(user_id: str, _=Depends(require_admin)):
     with _db_lock, db() as conn:
         cur = conn.execute("DELETE FROM users WHERE id=?", (user_id,))
@@ -451,12 +963,12 @@ async def admin_delete_user(user_id: str, _=Depends(require_admin)):
     return {"ok": True}
 
 
-@app.get("/api/admin/domains")
+@panel.get("/api/admin/domains")
 async def admin_domains(request: Request, _=Depends(require_admin)):
     return {"primary": request_host(request), "domains": enabled_domains()}
 
 
-@app.post("/api/admin/domains")
+@panel.post("/api/admin/domains")
 async def admin_add_domain(request: Request, _=Depends(require_admin)):
     domain = normalized_domain((await request.json()).get("domain", ""))
     with _db_lock, db() as conn:
@@ -464,7 +976,7 @@ async def admin_add_domain(request: Request, _=Depends(require_admin)):
     return {"ok": True, "domain": domain}
 
 
-@app.delete("/api/admin/domains/{domain}")
+@panel.delete("/api/admin/domains/{domain}")
 async def admin_delete_domain(domain: str, _=Depends(require_admin)):
     domain = normalized_domain(domain)
     with _db_lock, db() as conn:
@@ -472,30 +984,40 @@ async def admin_delete_domain(domain: str, _=Depends(require_admin)):
     return {"ok": True}
 
 
-@app.get("/api/v1/users")
-async def bot_list_users(request: Request, _=Depends(require_bot)):
+@panel.get("/api/v1/users")
+async def bot_list_users(request: Request, name: str | None = None, _=Depends(require_bot)):
+    if name:
+        user = get_user_by_name(name.strip())
+        return {"user": public_user(user, request_host(request)) if user else None}
     return {"users": [public_user(u, request_host(request)) for u in list_users()]}
 
 
-@app.post("/api/v1/users")
+@panel.get("/api/v1/stats")
+async def bot_stats(_=Depends(require_bot)):
+    with _db_lock, db() as conn:
+        row = conn.execute("SELECT COUNT(*) users, COALESCE(SUM(quota_bytes),0) allocated_bytes, COALESCE(SUM(used_bytes),0) used_bytes FROM users").fetchone()
+    return {"ok": True, "users": int(row["users"]), "allocated_bytes": int(row["allocated_bytes"]), "used_bytes": int(row["used_bytes"])}
+
+
+@panel.post("/api/v1/users")
 async def bot_create_user(request: Request, _=Depends(require_bot)):
     user = create_user_record(await request.json())
     return {"ok": True, "user": public_user(user, request_host(request))}
 
 
-@app.get("/api/v1/users/{user_id}")
+@panel.get("/api/v1/users/{user_id}")
 async def bot_get_user(user_id: str, request: Request, _=Depends(require_bot)):
     user = get_user(user_id)
     if not user: raise HTTPException(404, "user not found")
     return {"user": public_user(user, request_host(request))}
 
 
-@app.patch("/api/v1/users/{user_id}")
+@panel.patch("/api/v1/users/{user_id}")
 async def bot_update_user(user_id: str, request: Request, _=Depends(require_bot)):
     return {"ok": True, "user": public_user(update_user_record(user_id, await request.json()), request_host(request))}
 
 
-@app.delete("/api/v1/users/{user_id}")
+@panel.delete("/api/v1/users/{user_id}")
 async def bot_delete_user(user_id: str, _=Depends(require_bot)):
     with _db_lock, db() as conn:
         cur = conn.execute("DELETE FROM users WHERE id=?", (user_id,))
@@ -503,21 +1025,54 @@ async def bot_delete_user(user_id: str, _=Depends(require_bot)):
     return {"ok": True}
 
 
-@app.get("/sub/{sub_token}")
-async def subscription(sub_token: str, request: Request):
-    user = get_user_by_sub(sub_token)
-    if not user or not user_is_allowed(user):
-        raise HTTPException(404, "subscription unavailable")
-    primary = request_host(request)
-    links = [make_vless_link(user, d) for d in enabled_domains(primary)]
-    raw = "\n".join(links).encode()
-    encoded = base64.b64encode(raw)
+def raw_subscription(user: dict, links: list[str], sub_url: str) -> Response:
+    encoded = base64.b64encode("\n".join(links).encode())
+    expire = 0
+    if user.get("expires_at"):
+        try:
+            moment = datetime.fromisoformat(str(user["expires_at"]).replace("Z", "+00:00"))
+            if moment.tzinfo is None:
+                moment = moment.replace(tzinfo=timezone.utc)
+            expire = int(moment.timestamp())
+        except ValueError:
+            expire = 0
     headers = {
         "profile-title": "base64:" + base64.b64encode(user["name"].encode()).decode(),
         "profile-update-interval": "12", "cache-control": "no-store",
-        "subscription-userinfo": f"upload=0; download={user['used_bytes']}; total={user['quota_bytes'] or 0}; expire=0",
+        "profile-web-page-url": sub_url,
+        "subscription-userinfo": f"upload=0; download={user['used_bytes']}; total={user['quota_bytes'] or 0}; expire={expire}",
     }
     return Response(encoded, media_type="text/plain; charset=utf-8", headers=headers)
+
+
+def subscription_response(sub_token: str, request: Request, force_raw: bool = False):
+    user = get_user_by_sub(sub_token)
+    if not user:
+        raise HTTPException(404, "subscription unavailable")
+    primary = request_host(request)
+    links = [make_vless_link(user, d) for d in enabled_domains(primary)] if user_is_allowed(user) else []
+    sub_url = "https://" + primary + "/s/" + user["sub_token"]
+    if not force_raw and wants_html(request):
+        page = render_subscription_page(user, links, sub_url)
+        return HTMLResponse(content=page, headers=NOINDEX)
+    if not links:
+        raise HTTPException(404, "subscription unavailable")
+    return raw_subscription(user, links, sub_url)
+
+
+@app.get("/s/{sub_token}")
+async def subscription_smart(sub_token: str, request: Request, raw: int = 0):
+    return subscription_response(sub_token, request, force_raw=bool(raw))
+
+
+@app.get("/s/{sub_token}/raw")
+async def subscription_plain(sub_token: str, request: Request):
+    return subscription_response(sub_token, request, force_raw=True)
+
+
+@app.get("/sub/{sub_token}")
+async def subscription(sub_token: str, request: Request):
+    return subscription_response(sub_token, request, force_raw=True)
 
 
 @app.websocket("/connect/{path_token}")
@@ -624,6 +1179,26 @@ async def vless_ws(ws: WebSocket, path_token: str):
             _conn_counts[uid] = max(0, _conn_counts.get(uid, 1) - 1)
 
 
+def _is_api_path(path: str) -> bool:
+    for marker in ("/api/", "/auth/", "/s/", "/sub/"):
+        if marker in path:
+            return True
+    return False
+
+
 @app.exception_handler(HTTPException)
-async def http_error(_request: Request, exc: HTTPException):
+async def http_error(request: Request, exc: HTTPException):
+    if exc.status_code == 404 and not _is_api_path(request.url.path):
+        return HTMLResponse(content=FAKE_HTML, status_code=404, headers=NOINDEX)
     return JSONResponse({"ok": False, "error": exc.detail}, status_code=exc.status_code)
+
+
+app.include_router(panel, prefix=PANEL_PREFIX)
+if PANEL_PREFIX:
+    app.add_api_route(PANEL_PREFIX, panel_root, methods=["GET"])
+
+
+# هر مسیر ناشناس همان صفحه‌ی بی‌ربط را می‌دهد؛ نه خطای لو دهنده، نه ردیرکت به لاگین
+@app.get("/{full_path:path}")
+async def unknown_page(full_path: str):
+    return HTMLResponse(content=FAKE_HTML, status_code=404, headers=NOINDEX)

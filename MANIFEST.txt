@@ -17,3 +17,4 @@ railway.toml
 requirements.txt
 static/dashboard.html
 static/login.html
+tools/test-panel.py    تست خودکار پنل (مسیرها، وب‌پس، صفحه‌ی اشتراک) — بدون نیاز به FastAPI
